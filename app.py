@@ -50,6 +50,98 @@ role_models = joblib.load("role_models_by_field.pkl")
 # knn_career_recommender.py, retrain once, and re-download this file too.
 FEATURE_COLUMNS = joblib.load("feature_columns.pkl")
 
+# Maps a wide range of REAL course/major names to the nearest of the 14
+# categories the model was actually trained on (see data_pipeline.py
+# COURSE_TO_FIELD). Checked in order - more specific keywords first, so
+# e.g. "veterinary medicine" hits agricultural_sciences before "medicine"
+# would otherwise route it to medical_sciences.
+#
+# KNOWN LIMITATION: "Law" has no good home here. The real 200-student
+# training survey never included a Law respondent, and no personality
+# type was ever mapped to "Law & Public Service" as a fallback either -
+# meaning that field is structurally unreachable by this model no matter
+# what a student enters. Law students below are routed to social_sciences
+# as the closest available proxy, and the API adds an explicit note
+# flagging this. Properly fixing this requires collecting real Law
+# (and Pharmacy, Music, etc.) student survey responses and retraining -
+# see thesis limitations section.
+COURSE_KEYWORD_MAP = [
+    # (keywords to check, matched category)
+    (["veterinary"], "agricultural_sciences"),
+    (["agricultur", "animal science", "crop science", "soil science",
+      "forestry", "fisher"], "agricultural_sciences"),
+    (["computer science", "software", "information technology",
+      "cyber security", "cybersecurity", "computer engineering",
+      "information systems", "data science", "computing"], "it_computer_science"),
+    (["civil engineering", "mechanical engineering", "electrical",
+      "chemical engineering", "petroleum engineering", "mechatronic",
+      "industrial engineering", "telecommunications engineering",
+      "engineering"], "engineering"),
+    (["nursing", "physiology", "physiotherapy", "public health",
+      "medical laboratory", "radiography", "nutrition", "dietetics",
+      "biomedical", "optometry", "medical rehabilitation",
+      "anatomy"], "health_sciences"),
+    (["medicine", "surgery", "dentistry", "pharmacy", "pharmacology",
+      "pharmaceutical", "dental", "mbbs"], "medical_sciences"),
+    (["business admin", "accounting", "banking", "finance", "economics",
+      "marketing", "management", "insurance", "actuarial"], "business"),
+    (["environmental science", "urban planning", "estate management",
+      "architecture", "surveying", "geomatics",
+      "environmental management"], "environmental_technology_science"),
+    (["law", "legal studies", "jurisprudence", "llb"], "social_sciences"),
+    (["political science", "sociology", "psychology",
+      "international relations", "social work", "mass communication",
+      "journalism", "criminology", "public administration"], "social_sciences"),
+    (["geology", "mining", "geophysics"], "earth_&_mineral_sciences"),
+    (["physics", "chemistry", "mathematics", "statistics",
+      "industrial chemistry"], "physical_sciences"),
+    (["biology", "microbiology", "biochemistry", "botany", "zoology",
+      "genetics", "biotechnology"], "life_sciences"),
+    (["education", "guidance and counselling",
+      "curriculum"], "education"),
+    (["fine art", "music", "theatre", "creative art", "graphic design",
+      "fashion design", "english", "literature", "language",
+      "linguistics", "history", "philosophy",
+      "religious studies"], "arts_&_design"),
+]
+
+
+def match_course_to_category(raw_course: str) -> tuple[str, bool]:
+    """
+    Returns (matched_category_slug, is_confident_match).
+    Tries an exact match first (fastest, most reliable), then falls back
+    to keyword matching against COURSE_KEYWORD_MAP, then finally "other"
+    if nothing matches at all.
+    """
+    normalized = raw_course.strip().lower()
+
+    # Exact match against known training-time course strings
+    known_exact = {
+        "it/computer science": "it_computer_science",
+        "engineering": "engineering",
+        "health sciences": "health_sciences",
+        "medical sciences": "medical_sciences",
+        "business": "business",
+        "environmental technology/science": "environmental_technology_science",
+        "social sciences": "social_sciences",
+        "earth & mineral sciences": "earth_&_mineral_sciences",
+        "physical sciences": "physical_sciences",
+        "agricultural sciences": "agricultural_sciences",
+        "life sciences": "life_sciences",
+        "education": "education",
+        "arts & design": "arts_&_design",
+        "other": "other",
+    }
+    if normalized in known_exact:
+        return known_exact[normalized], True
+
+    # Keyword fallback for real course names not in the exact list
+    for keywords, category in COURSE_KEYWORD_MAP:
+        if any(kw in normalized for kw in keywords):
+            return category, True
+
+    return "other", False
+
 RIASEC_KEYS = ["realistic", "investigative", "artistic",
                "social", "enterprising", "conventional"]
 
@@ -140,15 +232,16 @@ def build_feature_vector(student: StudentInput) -> dict:
         else np.clip(0.55 * analytic + 0.45 * features["conscientiousness"], 0, 1)
     )
 
-    # Course one-hot: any course not seen during training maps to all-zero
-    # columns, meaning the model relies on RIASEC + skills alone for that
-    # student - a graceful fallback, not an error.
+    # Course one-hot: use smart matching instead of requiring an exact
+    # string match, so real course names (Pharmacy, Law, Music, etc.)
+    # get routed to their closest trained category instead of defaulting
+    # to blank/unknown.
+    matched_category, was_confident = match_course_to_category(student.course_of_study)
     for col in FEATURE_COLUMNS:
         if col.startswith("course_"):
-            course_slug = col.replace("course_", "").replace("_", " ")
-            features[col] = 1 if student.course_of_study.strip().lower() == course_slug else 0
+            features[col] = 1 if col == f"course_{matched_category}" else 0
 
-    return features
+    return features, matched_category, was_confident
 
 
 @app.get("/")
@@ -159,7 +252,7 @@ def root():
 @app.post("/predict")
 def predict(student: StudentInput, top_n: int = 5):
     try:
-        feature_dict = build_feature_vector(student)
+        feature_dict, matched_category, was_confident = build_feature_vector(student)
         x = np.array([[feature_dict[col] for col in FEATURE_COLUMNS]])
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing expected feature: {e}")
@@ -184,11 +277,28 @@ def predict(student: StudentInput, top_n: int = 5):
             for i in top_indices
         ]
 
+    notes = [
+        "Role-level rankings are currently based on illustrative proxy "
+        "labels pending real role-preference survey data - see thesis "
+        "limitations section."
+    ]
+    if matched_category == "social_sciences" and "law" in student.course_of_study.lower():
+        notes.append(
+            "Law was matched to Social Sciences as the closest available "
+            "category - the model was not trained on any Law student "
+            "survey data, so this prediction is a rough proxy, not a "
+            "confident Law-specific recommendation."
+        )
+    elif not was_confident:
+        notes.append(
+            f"'{student.course_of_study}' didn't closely match a known "
+            f"course category, so this prediction relies more heavily on "
+            f"personality and skills than on your field of study."
+        )
+
     return {
         "predicted_field": predicted_field,
         "field_confidence": field_confidence,
         "recommended_roles": role_predictions,
-        "note": "Role-level rankings are currently based on illustrative "
-                "proxy labels pending real role-preference survey data - "
-                "see thesis limitations section.",
+        "note": " ".join(notes),
     }
