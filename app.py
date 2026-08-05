@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from fuzzy_logic.fuzzy_engine import build_fuzzy_system, adjust_scores, get_wellbeing_flag
+
 app = FastAPI(title="CareerPath AI Prediction API")
 
 # Allow your Lovable/Base44 frontend (any origin) to call this API.
@@ -43,6 +45,14 @@ field_model = joblib.load("field_model.pkl")
 field_scaler = joblib.load("field_scaler.pkl")
 field_encoder = joblib.load("field_label_encoder.pkl")
 role_models = joblib.load("role_models_by_field.pkl")
+
+# --- Build the fuzzy inference system once, at startup ---
+# Adjusts KNN role compatibility scores based on the student's stress and
+# burnout levels - a student with high stress/burnout gets scores nudged
+# toward lower-pressure roles, and receives a wellbeing note. See
+# fuzzy_logic/fuzzy_engine.py for the full Mamdani FIS implementation
+# (membership functions, rule base, centroid defuzzification).
+fuzzy_simulation = build_fuzzy_system()
 
 # The list + order of columns the model was trained on. If you don't have
 # this saved yet, add `joblib.dump(feature_columns, "feature_columns.pkl")`
@@ -72,7 +82,9 @@ COURSE_KEYWORD_MAP = [
       "forestry", "fisher"], "agricultural_sciences"),
     (["computer science", "software", "information technology",
       "cyber security", "cybersecurity", "computer engineering",
-      "information systems", "data science", "computing"], "it_computer_science"),
+      "information systems", "info systems", "mgt info sys",
+      "management information systems", "data science",
+      "computing"], "it_computer_science"),
     (["civil engineering", "mechanical engineering", "electrical",
       "chemical engineering", "petroleum engineering", "mechatronic",
       "industrial engineering", "telecommunications engineering",
@@ -277,6 +289,24 @@ def predict(student: StudentInput, top_n: int = 5):
             for i in top_indices
         ]
 
+    # Fuzzy wellbeing adjustment: nudge role scores based on the student's
+    # stress and burnout levels (Mamdani FIS - see fuzzy_logic/fuzzy_engine.py).
+    # KNN scores are 0-1; the fuzzy engine works on a 0-100 scale, so we
+    # convert, adjust, then convert back for API consistency.
+    wellbeing_note = None
+    wellbeing_flag = None
+    fuzzy_adjustment = None
+    if role_predictions:
+        scores_100 = {r["career"]: r["compatibility_score"] * 100 for r in role_predictions}
+        adjusted_100, fuzzy_adjustment, wellbeing_note = adjust_scores(
+            scores_100, student.stress_level, student.burnout_level
+        )
+        wellbeing_flag = get_wellbeing_flag(fuzzy_adjustment)
+
+        for r in role_predictions:
+            r["compatibility_score"] = round(adjusted_100[r["career"]] / 100, 4)
+        role_predictions.sort(key=lambda r: r["compatibility_score"], reverse=True)
+
     notes = [
         "Role-level rankings are currently based on illustrative proxy "
         "labels pending real role-preference survey data - see thesis "
@@ -296,9 +326,15 @@ def predict(student: StudentInput, top_n: int = 5):
             f"personality and skills than on your field of study."
         )
 
-    return {
+    response = {
         "predicted_field": predicted_field,
         "field_confidence": field_confidence,
         "recommended_roles": role_predictions,
         "note": " ".join(notes),
+        "wellbeing": {
+            "fuzzy_adjustment": fuzzy_adjustment,
+            "flag": wellbeing_flag,
+            "message": wellbeing_note,
+        },
     }
+    return response
